@@ -1,0 +1,31 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: reachinbox-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: reachinbox
+      MYSQL_USER: reachuser
+      MYSQL_PASSWORD: reachpass
+    ports: ["3307:3306"]
+    volumes: [mysql_data:/var/lib/mysql]
+  redis:
+    image: redis:7-alpine
+    container_name: reachinbox-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redis_data:/data]
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: reachinbox-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["9200:9200"]
+    volumes: [es_data:/usr/share/elasticsearch/data]
+volumes:
+  mysql_data:
+  redis_data:
+  es_data:

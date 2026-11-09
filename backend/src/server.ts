@@ -1,0 +1,489 @@
+
+import express from "express";
+import cors from "cors";
+import session from "express-session";
+import passport from "./auth";
+import { initDb, pool } from "./db";
+import { config } from "./config";
+import { emailQueue } from "./queue";
+import { indexEmail, es } from "./search";
+import { createBullBoard } from "@bull-board/api";
+import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
+import { ExpressAdapter } from "@bull-board/express";
+import axios from "axios";
+import { randomUUID } from "crypto";
+
+const app = express();
+
+// ==========================================
+// MIDDLEWARE
+// ==========================================
+
+app.use(
+  cors({
+    origin: config.frontendUrl,
+    credentials: true
+  })
+);
+
+app.use(express.json({ limit: "5mb" }));
+
+app.use(
+  session({
+    secret: config.sessionSecret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false
+    }
+  })
+);
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// ==========================================
+// CURRENT USER
+// ==========================================
+
+function currentUser(req: express.Request) {
+  if (req.user) {
+    return req.user;
+  }
+
+  if (process.env.NODE_ENV !== "production") {
+    return {
+      id: 1,
+      name: "Local Demo User",
+      email: "demo@reachinbox.local",
+      avatar: ""
+    };
+  }
+
+  return null;
+}
+
+// ==========================================
+// CREATE DEMO USER
+// ==========================================
+
+async function ensureDemoUser() {
+  await pool.execute(
+    `INSERT INTO users (id, name, email)
+     VALUES (1, 'Local Demo User', 'demo@reachinbox.local')
+     ON DUPLICATE KEY UPDATE name = name`
+  );
+}
+
+// ==========================================
+// HEALTH CHECK
+// ==========================================
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+// ==========================================
+// GOOGLE OAUTH
+// ==========================================
+
+app.get("/auth/google", (req, res, next) => {
+  if (!config.googleId) {
+    return res
+      .status(503)
+      .send("Configure Google OAuth in backend/.env first");
+  }
+
+  passport.authenticate("google", {
+    scope: ["profile", "email"]
+  })(req, res, next);
+});
+
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", {
+    failureRedirect: `${config.frontendUrl}/?login=failed`
+  }),
+  (_req, res) => {
+    res.redirect(config.frontendUrl);
+  }
+);
+
+app.get("/auth/me", (req, res) => {
+  res.json({
+    user: currentUser(req)
+  });
+});
+
+app.post("/auth/logout", (req, res) => {
+  req.logout(() => {
+    res.json({ ok: true });
+  });
+});
+
+// ==========================================
+// SLACK OAUTH
+// ==========================================
+
+app.get("/auth/slack", (req, res) => {
+  if (!config.slackId) {
+    return res
+      .status(503)
+      .send("Configure Slack OAuth in backend/.env first");
+  }
+
+  const state = randomUUID();
+
+  (req.session as any).slackState = state;
+
+  const url = new URL(
+    "https://slack.com/oauth/v2/authorize"
+  );
+
+  url.searchParams.set("client_id", config.slackId);
+  url.searchParams.set("scope", "chat:write");
+  url.searchParams.set("redirect_uri", config.slackCallback);
+  url.searchParams.set("state", state);
+
+  res.redirect(url.toString());
+});
+
+app.get("/auth/slack/callback", async (req, res) => {
+  try {
+    if (
+      req.query.state !==
+      (req.session as any).slackState
+    ) {
+      return res.status(400).send("Invalid OAuth state");
+    }
+
+    const tokenResult = await axios.post(
+      "https://slack.com/api/oauth.v2.access",
+      null,
+      {
+        params: {
+          code: req.query.code,
+          client_id: config.slackId,
+          client_secret: config.slackSecret,
+          redirect_uri: config.slackCallback
+        }
+      }
+    );
+
+    if (!tokenResult.data.ok) {
+      console.error("Slack token error:", tokenResult.data);
+      return res.status(400).send("Slack authorization failed");
+    }
+
+    const accessToken = tokenResult.data.access_token;
+    const user = currentUser(req);
+
+    if (accessToken && user) {
+      await pool.execute(
+        "UPDATE users SET slack_access_token = ? WHERE id = ?",
+        [accessToken, user.id]
+      );
+    }
+
+    delete (req.session as any).slackState;
+
+    res.redirect(config.frontendUrl);
+  } catch (error) {
+    console.error("Slack OAuth error:", error);
+
+    res.status(500).send("Slack connection failed");
+  }
+});
+
+// ==========================================
+// SCHEDULE EMAILS
+// ==========================================
+
+app.post("/api/emails/schedule", async (req, res) => {
+  const user = currentUser(req);
+
+  if (!user) {
+    return res.status(401).json({
+      error: "Please log in"
+    });
+  }
+
+  const {
+    recipients,
+    subject,
+    body,
+    startAt,
+    delaySeconds = 0,
+    hourlyLimit
+  } = req.body;
+
+  if (
+    !Array.isArray(recipients) ||
+    recipients.length === 0 ||
+    !subject ||
+    !body ||
+    !startAt
+  ) {
+    return res.status(400).json({
+      error: "recipients, subject, body and startAt are required"
+    });
+  }
+
+  // Validate email addresses
+  const valid = recipients
+    .map((x: unknown) => String(x).trim())
+    .filter((x: string) =>
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(x)
+    );
+
+  if (valid.length === 0) {
+    return res.status(400).json({
+      error: "No valid email addresses found"
+    });
+  }
+
+  const start = new Date(startAt);
+
+  if (Number.isNaN(start.getTime())) {
+    return res.status(400).json({
+      error: "Invalid startAt date"
+    });
+  }
+
+  try {
+    const ids: number[] = [];
+
+    for (let i = 0; i < valid.length; i++) {
+      const recipient = valid[i];
+
+      const scheduledAt = new Date(
+        start.getTime() +
+        i * Math.max(0, Number(delaySeconds)) * 1000
+      );
+
+      const key = `${user.id}:${recipient}:${randomUUID()}`;
+
+      // Save email in MySQL
+      const [result]: any = await pool.execute(
+        `INSERT INTO emails
+        (user_id, recipient, subject, body, scheduled_at, status, idempotency_key)
+        VALUES (?, ?, ?, ?, ?, 'scheduled', ?)`,
+        [
+          user.id,
+          recipient,
+          subject,
+          body,
+          scheduledAt,
+          key
+        ]
+      );
+
+      const id = Number(result.insertId);
+
+      ids.push(id);
+
+      // Add email job to BullMQ
+      await emailQueue.add(
+        "send-email",
+        {
+          emailId: id,
+          hourlyLimit: Number(
+            hourlyLimit || config.hourlyLimit
+          )
+        },
+        {
+          // Custom BullMQ job IDs must not be purely numeric
+          jobId: `email-${id}`,
+          delay: Math.max(
+            0,
+            scheduledAt.getTime() - Date.now()
+          )
+        }
+      );
+
+      // Index email in Elasticsearch
+      await indexEmail({
+        id,
+        user_id: user.id,
+        recipient,
+        subject,
+        body,
+        status: "scheduled",
+        scheduled_at: scheduledAt
+      });
+    }
+
+    res.status(201).json({
+      message: "Emails scheduled",
+      count: ids.length,
+      ids
+    });
+  } catch (error) {
+    console.error("Email scheduling error:", error);
+
+    res.status(500).json({
+      error: "Unable to schedule emails"
+    });
+  }
+});
+
+// ==========================================
+// GET EMAILS
+// ==========================================
+
+app.get("/api/emails", async (req, res) => {
+  const user = currentUser(req);
+
+  if (!user) {
+    return res.status(401).json({
+      error: "Please log in"
+    });
+  }
+
+  const status = String(req.query.status || "");
+
+  const allowed = [
+    "scheduled",
+    "processing",
+    "sent",
+    "failed"
+  ];
+
+  const params: any[] = [user.id];
+
+  let sql = `
+    SELECT
+      id,
+      recipient,
+      subject,
+      scheduled_at,
+      sent_at,
+      status,
+      error_message
+    FROM emails
+    WHERE user_id = ?
+  `;
+
+  if (allowed.includes(status)) {
+    sql += " AND status = ?";
+    params.push(status);
+  }
+
+  sql += " ORDER BY created_at DESC LIMIT 500";
+
+  try {
+    const [rows] = await pool.execute(sql, params);
+
+    res.json(rows);
+  } catch (error) {
+    console.error("Get emails error:", error);
+
+    res.status(500).json({
+      error: "Unable to fetch emails"
+    });
+  }
+});
+
+// ==========================================
+// SEARCH EMAILS USING ELASTICSEARCH
+// ==========================================
+
+app.get("/api/emails/search", async (req, res) => {
+  const user = currentUser(req);
+
+  if (!user) {
+    return res.status(401).json({
+      error: "Please log in"
+    });
+  }
+
+  const q = String(req.query.q || "").trim();
+
+  if (!q) {
+    return res.json([]);
+  }
+
+  try {
+    const result = await es.search({
+      index: "reachinbox-emails",
+      query: {
+        bool: {
+          must: [
+            {
+              multi_match: {
+                query: q,
+                fields: ["recipient", "subject", "body"]
+              }
+            }
+          ],
+          filter: [
+            {
+              term: {
+                user_id: user.id
+              }
+            }
+          ]
+        }
+      }
+    });
+
+    res.json(
+      result.hits.hits.map((hit: any) => hit._source)
+    );
+  } catch (error) {
+    console.error("Email search error:", error);
+
+    res.status(503).json({
+      error: "Search service is unavailable"
+    });
+  }
+});
+
+// ==========================================
+// START SERVER AND BULL BOARD
+// ==========================================
+
+async function start() {
+  try {
+    // Initialize database
+    await initDb();
+
+    // Create demo user in development
+    if (process.env.NODE_ENV !== "production") {
+      await ensureDemoUser();
+    }
+
+    // Configure Bull Board
+    const board = new ExpressAdapter();
+
+    board.setBasePath("/admin/queues");
+
+    createBullBoard({
+      queues: [
+        new BullMQAdapter(emailQueue)
+      ],
+      serverAdapter: board
+    });
+
+    // IMPORTANT: Get router from ExpressAdapter
+    app.use("/admin/queues", board.getRouter());
+
+    // Start Express server
+    app.listen(config.port, () => {
+      console.log(
+        `API running at http://localhost:${config.port}`
+      );
+
+      console.log(
+        `Bull Board running at http://localhost:${config.port}/admin/queues`
+      );
+    });
+  } catch (error) {
+    console.error("Server startup failed:", error);
+    process.exit(1);
+  }
+}
+
+start();
