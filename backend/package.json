@@ -1,11 +1,12 @@
 {
   "name": "reachinbox-backend",
   "version": "1.0.0",
-  "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "worker": "tsx watch src/worker.ts",
-    "build": "tsc",
-    "start": "node dist/server.js"
+ "scripts": {
+  "dev": "tsx watch src/server.ts",
+  "worker": "tsx watch src/worker.ts",
+  "build": "tsc",
+  "start": "node dist/server.js",
+  "start:worker": "node dist/worker.js"
   },
   "dependencies": {
     "@bull-board/api": "^6.21.3",
